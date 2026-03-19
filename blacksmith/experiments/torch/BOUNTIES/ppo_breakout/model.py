@@ -39,10 +39,10 @@ class BreakoutCNN(nn.Module):
         self.critic = layer_init(nn.Linear(512, 1), std=1.0)
 
     def get_value(self, x: torch.Tensor) -> torch.Tensor:
-        return self.critic(self.network(x / self.PIXEL_SCALE))
+        return self.critic(self.network(x))
 
     def get_action_and_value(self, x: torch.Tensor, action=None):
-        hidden = self.network(x / self.PIXEL_SCALE)
+        hidden = self.network(x)
         logits = self.actor(hidden)
         dist = Categorical(logits=logits, validate_args=False)
         if action is None:

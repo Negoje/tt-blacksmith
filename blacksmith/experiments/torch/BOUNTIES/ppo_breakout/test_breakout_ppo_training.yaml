@@ -24,7 +24,7 @@ max_grad_norm: 0.5
 # Logging settings
 log_level: "INFO"
 log_interval: 1
-use_wandb: True
+use_wandb: False
 wandb_project: "ALE-Breakout-PPO"
 wandb_run_name: "tt-breakout-ppo"
 wandb_tags: ["ppo", "atari", "breakout"]
@@ -55,4 +55,4 @@ deterministic: True
 
 # Other settings
 framework: "pytorch"
-use_tt: False
+use_tt: True

@@ -1,0 +1,51 @@
+2026-03-19 12:02:04.007 | WARNING  | torch_plugin_tt:__init__:38 - TT plugin is setting XLA_STABLEHLO_COMPILE to 1. This is required for TT PJRT plugin to work correctly.
+2026-03-19 12:02:06.562424: W torch_xla/csrc/runtime/profiler.cpp:88] Profiler API not found for PJRT plugin
+2026-03-19 12:02:06 | INFO | Using device: xla:0
+INFO:tt-breakout-ppo:Using device: xla:0
+A.L.E: Arcade Learning Environment (version 0.11.2+ecc1138)
+[Powered by Stella]
+2026-03-19 12:02:07 | INFO | Model parameters: 1662117
+INFO:tt-breakout-ppo:Model parameters: 1662117
+2026-03-19 12:02:08 | INFO | Starting PPO training on ALE/Breakout-v5
+INFO:tt-breakout-ppo:Starting PPO training on ALE/Breakout-v5
+2026-03-19 12:02:08 | INFO |   Total timesteps : 10,000,000
+INFO:tt-breakout-ppo:  Total timesteps : 10,000,000
+2026-03-19 12:02:08 | INFO |   Batch size      : 1024
+INFO:tt-breakout-ppo:  Batch size      : 1024
+2026-03-19 12:02:08 | INFO |   Minibatch size  : 256
+INFO:tt-breakout-ppo:  Minibatch size  : 256
+2026-03-19 12:02:08 | INFO |   Num updates     : 9765
+INFO:tt-breakout-ppo:  Num updates     : 9765
+2026-03-19 12:02:08 | ERROR | Training failed with error: Cannot infer shape for dot operation: f32[8,4096] <dot> f32[3136,512]. Contracting dimension sizes are not compatible.
+ERROR:tt-breakout-ppo:Training failed with error: Cannot infer shape for dot operation: f32[8,4096] <dot> f32[3136,512]. Contracting dimension sizes are not compatible.
+Traceback (most recent call last):
+  File "/home/ttuser/fnegojevic/tt-blacksmith/blacksmith/experiments/torch/BOUNTIES/ppo_breakout/test_breakout_ppo_training.py", line 399, in <module>
+    train(config, device_manager, logger, checkpoint_manager)
+  File "/home/ttuser/fnegojevic/tt-blacksmith/blacksmith/experiments/torch/BOUNTIES/ppo_breakout/test_breakout_ppo_training.py", line 292, in train
+    action, log_prob, _, value = agent.get_action_and_value(obs)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/blacksmith/experiments/torch/BOUNTIES/ppo_breakout/model.py", line 45, in get_action_and_value
+    hidden = self.network(x)
+             ^^^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/env/xla_env/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/env/xla_env/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/env/xla_env/lib/python3.12/site-packages/torch/nn/modules/container.py", line 250, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/env/xla_env/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/env/xla_env/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/env/xla_env/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ttuser/fnegojevic/tt-blacksmith/env/xla_env/lib/python3.12/site-packages/tt_torch/torch_overrides.py", line 22, in __torch_function__
+    return func(*args, **(kwargs or {}))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Cannot infer shape for dot operation: f32[8,4096] <dot> f32[3136,512]. Contracting dimension sizes are not compatible.

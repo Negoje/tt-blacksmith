@@ -9,12 +9,9 @@ import ale_py
 import gymnasium as gym
 import numpy as np
 import torch
+import torch_xla
 
-gym.register_envs(ale_py)
-
-from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.breakout_rollout import (
-    RolloutBuffer,
-)
+from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.breakout_rollout import RolloutBuffer
 from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.configs import TrainingConfig
 from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.model import BreakoutCNN
 from blacksmith.tools.checkpoints_manager import CheckpointManager
@@ -22,6 +19,8 @@ from blacksmith.tools.cli import generate_config, parse_cli_options
 from blacksmith.tools.device_manager import DeviceManager
 from blacksmith.tools.logging_manager import TrainingLogger
 from blacksmith.tools.reproducibility_manager import ReproducibilityManager
+
+gym.register_envs(ale_py)
 
 # ---------------------------------------------------------------------------
 # Environment wrappers
@@ -83,19 +82,17 @@ def make_env(env_id: str, idx: int, seed: int, config: TrainingConfig):
         env = gym.wrappers.RecordEpisodeStatistics(env)  # Track episode return and length for logging
         env = gym.wrappers.AtariPreprocessing(
             env,
-            noop_max=30,  # Random no-ops on reset to add stochasticity to starting states
-            frame_skip=config.frame_skip,  # Repeat each action for N frames, max-pooling last 2 to avoid flickering
-            screen_size=84,  # Downscale to 84x84 to reduce input dimensionality
-            terminal_on_life_loss=False,  # Handled by EpisodicLifeEnv wrapper instead
-            grayscale_obs=True,  # Convert RGB to single channel, reducing input size by 3x
-            scale_obs=False,  # Keep uint8 pixels; the model normalizes via PIXEL_SCALE
+            noop_max=30,                     # Random no-ops on reset to add stochasticity to starting states
+            frame_skip=config.frame_skip,    # Repeat each action for N frames, max-pooling last 2 to avoid flickering
+            screen_size=84,                  # Downscale to 84x84 to reduce input dimensionality
+            terminal_on_life_loss=False,     # Handled by EpisodicLifeEnv wrapper instead
+            grayscale_obs=True,              # Convert RGB to single channel, reducing input size by 3x
+            scale_obs=True,                 # Keep uint8 pixels; the model normalizes via PIXEL_SCALE
         )
         env = EpisodicLifeEnv(env)
         env = FireResetEnv(env)
         env = ClipRewardEnv(env)
-        env = gym.wrappers.FrameStackObservation(
-            env, config.frame_stack
-        )  # Stack N consecutive frames to give the agent temporal context
+        env = gym.wrappers.FrameStackObservation(env, config.frame_stack)  # Stack N consecutive frames to give the agent temporal context
         env.action_space.seed(seed + idx)
         env.observation_space.seed(seed + idx)
         return env
@@ -117,28 +114,43 @@ def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingCo
     b_obs, b_actions, b_log_probs, b_values = buffer.flatten()
     b_advantages = advantages.reshape(-1)
     b_returns = returns.reshape(-1)
-
+    torch_xla.sync()
     clip_fracs = []
+    logger.info("[DEBUG SYNC] PPO enter")
 
     for _ in range(config.update_epochs):
-        indices = torch.randperm(config.batch_size, device=b_obs.device)
-        for start in range(0, config.batch_size, config.minibatch_size):
-            end = start + config.minibatch_size
-            mb_idx = indices[start:end]
+        # Permutaion generated on CPU
+        indices = torch.randperm(config.batch_size).to(b_obs.device)
+        all_mb_indices = indices.reshape(-1, config.minibatch_size)
 
+        torch_xla.sync()
+        print("all_mb_indices:", all_mb_indices.cpu().numpy())
+        logger.info("[DEBUG SYNC] Permutation after")
+        for i in range(4):
+            logger.info("[DEBUG SYNC] For start")
+            mb_idx = all_mb_indices[i]
+            
+            #torch_xla.sync()
+            logger.info("[DEBUG SYNC] Before PPO get_action_and_value")
             _, new_log_prob, entropy, new_value = agent.get_action_and_value(b_obs[mb_idx], b_actions[mb_idx])
             log_ratio = new_log_prob - b_log_probs[mb_idx]
             ratio = log_ratio.exp()
-
+            
+           # torch_xla.sync()
+            logger.info("[DEBUG SYNC] Before PPO KL")
             with torch.no_grad():
                 # calculate approx_kl http://joschu.net/blog/kl-approx.html
                 approx_kl = ((ratio - 1) - log_ratio).mean()
-                clip_fracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean().item())
+                #clip_fracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean().item())
 
+            logger.info("[DEBUG SYNC] After PPO KL")
             mb_adv = b_advantages[mb_idx]
             if config.norm_adv:
                 mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
+           # torch_xla.sync()
+            logger.info("[DEBUG SYNC] Before loss")
+            
             # Policy loss
             pg_loss1 = -mb_adv * ratio
             pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
@@ -156,14 +168,63 @@ def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingCo
             else:
                 v_loss = 0.5 * ((new_value - b_returns[mb_idx]) ** 2).mean()
 
-            entropy_loss = entropy.mean()
-            loss = pg_loss - config.ent_coef * entropy_loss + config.vf_coef * v_loss
+            # entropy_loss = entropy.mean()
+            # hidden = agent.network(b_obs[mb_idx])
+            # loss = agent.critic(hidden).mean()
 
+            """FIRST CONV2D LAYER WORKS"""
+            # mb_idx = all_mb_indices[i]
+            # x = b_obs[mb_idx]
+            # x = agent.network[:2](x)  # first Conv2d only
+            # loss = x.mean()
+
+            """FIRST TWO CONV2D LAYERS FAILS"""
+            # mb_idx = all_mb_indices[i]
+            # x = b_obs[mb_idx]
+            # x = agent.network[:4](x)  # first Conv2d only
+            # loss = x.mean()
+
+            """SECOND CONV2D LAYER FAILS"""
+            mb_idx = all_mb_indices[i]
+            x = b_obs[mb_idx]
+            with torch.no_grad():
+                x = agent.network[:2](x)  # first Conv2d + ReLU, no grad
+            x = x.detach().requires_grad_(True)
+            x = agent.network[2:4](x)  # second Conv2d + ReLU only
+            loss = x.mean()
+
+            """AFTER SECOND CONV2D LAYERS PASS"""
+            # mb_idx = all_mb_indices[i]
+            # x = b_obs[mb_idx]
+            # with torch.no_grad():
+            #     x = agent.network[:4](x)  # first Conv2d + ReLU, no grad
+            # x = x.detach().requires_grad_(True)
+            # x = agent.network[4:](x)  # second Conv2d + ReLU only
+            # loss = x.mean()
+
+            # pg_loss - config.ent_coef * entropy_loss + config.vf_coef * v_loss
+            # pg - crash
+            # entropy_loss - crash
+            # v_loss - crash
+            # dummy - outputs of the network
+            # new_value.mean() - crash
+
+
+            # first Conv2d - pass!
+            # second Conv2d - crash
+            logger.info("[DEBUG SYNC] After loss")
+           # torch_xla.sync()
+            
             optimizer.zero_grad()
             loss.backward()
+            break
             torch.nn.utils.clip_grad_norm_(agent.parameters(), config.max_grad_norm)
             optimizer.step()
 
+            logger.info("[DEBUG SYNC] After step")
+            torch_xla.sync()
+
+    logger.info("[DEBUG SYNC] END PPO")
     return pg_loss.item(), v_loss.item(), entropy_loss.item(), approx_kl.item(), np.mean(clip_fracs)
 
 
@@ -245,6 +306,8 @@ def train(
                 obs = torch.tensor(next_obs, device=device)
                 done = torch.tensor(next_done, device=device)
 
+                torch_xla.sync()
+
                 # Log completed episodes.
                 if "_episode" in infos:
                     for i, finished in enumerate(infos["_episode"]):
@@ -255,7 +318,8 @@ def train(
             with torch.no_grad():
                 next_value = agent.get_value(obs).flatten()
             advantages, returns = buffer.compute_gae(next_value, done)
-
+            logger.info("[DEBUG SYNC] GAE After")
+            torch_xla.sync()
             # PPO update.
             pg_loss, v_loss, ent_loss, approx_kl, clip_frac = ppo_update(
                 agent, optimizer, buffer, advantages, returns, config
