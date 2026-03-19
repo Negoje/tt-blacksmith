@@ -175,6 +175,7 @@ def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingCo
             # entropy_loss = entropy.mean()
             # hidden = agent.network(b_obs[mb_idx])
             # loss = agent.critic(hidden).mean()
+            #test
 
             """FIRST CONV2D LAYER WORKS"""
             # mb_idx = all_mb_indices[i]
