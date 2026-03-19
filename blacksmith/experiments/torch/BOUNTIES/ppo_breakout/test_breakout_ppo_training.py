@@ -11,7 +11,9 @@ import numpy as np
 import torch
 import torch_xla
 
-from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.breakout_rollout import RolloutBuffer
+from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.breakout_rollout import (
+    RolloutBuffer,
+)
 from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.configs import TrainingConfig
 from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.model import BreakoutCNN
 from blacksmith.tools.checkpoints_manager import CheckpointManager
@@ -82,17 +84,19 @@ def make_env(env_id: str, idx: int, seed: int, config: TrainingConfig):
         env = gym.wrappers.RecordEpisodeStatistics(env)  # Track episode return and length for logging
         env = gym.wrappers.AtariPreprocessing(
             env,
-            noop_max=30,                     # Random no-ops on reset to add stochasticity to starting states
-            frame_skip=config.frame_skip,    # Repeat each action for N frames, max-pooling last 2 to avoid flickering
-            screen_size=84,                  # Downscale to 84x84 to reduce input dimensionality
-            terminal_on_life_loss=False,     # Handled by EpisodicLifeEnv wrapper instead
-            grayscale_obs=True,              # Convert RGB to single channel, reducing input size by 3x
-            scale_obs=True,                 # Keep uint8 pixels; the model normalizes via PIXEL_SCALE
+            noop_max=30,  # Random no-ops on reset to add stochasticity to starting states
+            frame_skip=config.frame_skip,  # Repeat each action for N frames, max-pooling last 2 to avoid flickering
+            screen_size=84,  # Downscale to 84x84 to reduce input dimensionality
+            terminal_on_life_loss=False,  # Handled by EpisodicLifeEnv wrapper instead
+            grayscale_obs=True,  # Convert RGB to single channel, reducing input size by 3x
+            scale_obs=True,  # Keep uint8 pixels; the model normalizes via PIXEL_SCALE
         )
         env = EpisodicLifeEnv(env)
         env = FireResetEnv(env)
         env = ClipRewardEnv(env)
-        env = gym.wrappers.FrameStackObservation(env, config.frame_stack)  # Stack N consecutive frames to give the agent temporal context
+        env = gym.wrappers.FrameStackObservation(
+            env, config.frame_stack
+        )  # Stack N consecutive frames to give the agent temporal context
         env.action_space.seed(seed + idx)
         env.observation_space.seed(seed + idx)
         return env
@@ -129,28 +133,28 @@ def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingCo
         for i in range(4):
             logger.info("[DEBUG SYNC] For start")
             mb_idx = all_mb_indices[i]
-            
-            #torch_xla.sync()
+
+            # torch_xla.sync()
             logger.info("[DEBUG SYNC] Before PPO get_action_and_value")
             _, new_log_prob, entropy, new_value = agent.get_action_and_value(b_obs[mb_idx], b_actions[mb_idx])
             log_ratio = new_log_prob - b_log_probs[mb_idx]
             ratio = log_ratio.exp()
-            
-           # torch_xla.sync()
+
+            # torch_xla.sync()
             logger.info("[DEBUG SYNC] Before PPO KL")
             with torch.no_grad():
                 # calculate approx_kl http://joschu.net/blog/kl-approx.html
                 approx_kl = ((ratio - 1) - log_ratio).mean()
-                #clip_fracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean().item())
+                # clip_fracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean().item())
 
             logger.info("[DEBUG SYNC] After PPO KL")
             mb_adv = b_advantages[mb_idx]
             if config.norm_adv:
                 mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
-           # torch_xla.sync()
+            # torch_xla.sync()
             logger.info("[DEBUG SYNC] Before loss")
-            
+
             # Policy loss
             pg_loss1 = -mb_adv * ratio
             pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
@@ -209,12 +213,11 @@ def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingCo
             # dummy - outputs of the network
             # new_value.mean() - crash
 
-
             # first Conv2d - pass!
             # second Conv2d - crash
             logger.info("[DEBUG SYNC] After loss")
-           # torch_xla.sync()
-            
+            # torch_xla.sync()
+
             optimizer.zero_grad()
             loss.backward()
             break
