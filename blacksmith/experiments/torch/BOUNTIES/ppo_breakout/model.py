@@ -4,7 +4,6 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -42,7 +41,26 @@ class BreakoutCNN(nn.Module):
     def get_action_and_value(self, x: torch.Tensor, action=None):
         hidden = self.network(x)
         logits = self.actor(hidden)
-        dist = Categorical(logits=logits, validate_args=False)
+        target_device = logits.device
+
+        # Offload the categorical math to CPU: TT bf16/fp32 softmax+entropy
+        # diverges from CPU by ~5e-2 (entropy) and ~4e-2 (loss). Running it on
+        # the host brings diff down to ~1e-6 (entropy) / ~1e-4 (loss) with
+        # negligible cost (logits shape is [B, num_actions]).
+        logits_host = logits.to("cpu").float()
+        log_probs_host = torch.log_softmax(logits_host, dim=-1)
+        probs_host = log_probs_host.exp()
+
         if action is None:
-            action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), self.critic(hidden)
+            # Sample on CPU with multinomial, then move back to TT.
+            action_host = torch.multinomial(probs_host, num_samples=1).squeeze(-1)
+            action = action_host.to(target_device)
+        else:
+            action_host = action.to("cpu")
+
+        log_prob_host = log_probs_host.gather(-1, action_host.unsqueeze(-1)).squeeze(-1)
+        entropy_host = -(probs_host * log_probs_host).sum(dim=-1)
+
+        log_prob = log_prob_host.to(target_device)
+        entropy = entropy_host.to(target_device)
+        return action, log_prob, entropy, self.critic(hidden)

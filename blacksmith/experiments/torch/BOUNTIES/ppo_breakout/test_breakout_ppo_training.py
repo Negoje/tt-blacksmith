@@ -7,8 +7,9 @@ from pathlib import Path
 
 import ale_py
 import gymnasium as gym
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+import torch_xla
 
 from blacksmith.experiments.torch.BOUNTIES.ppo_breakout.breakout_rollout import (
     RolloutBuffer,
@@ -23,8 +24,10 @@ from blacksmith.tools.reproducibility_manager import ReproducibilityManager
 
 gym.register_envs(ale_py)
 
-# Small epsilon added to standard deviation when normalizing advantages, to avoid division by zero
-ADV_NORM_EPS = 1e-8
+import os
+
+os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
+os.environ.setdefault("TTXLA_LOGGER_LEVEL", "ERROR")
 
 # ---------------------------------------------------------------------------
 # Environment wrappers
@@ -61,7 +64,7 @@ class FireResetEnv(gym.Wrapper):
     # Press FIRE after reset to launch the ball
 
     def reset(self, **kwargs):
-        self.env.reset(**kwargs)
+        obs, info = self.env.reset(**kwargs)
         obs, _, terminated, truncated, info = self.env.step(1)
         if terminated or truncated:
             obs, info = self.env.reset(**kwargs)
@@ -72,7 +75,7 @@ class ClipRewardEnv(gym.RewardWrapper):
     # Clip rewards to {-1, 0, +1}
 
     def reward(self, reward):
-        return float((reward > 0) - (reward < 0))
+        return np.sign(reward)
 
 
 # ---------------------------------------------------------------------------
@@ -80,9 +83,9 @@ class ClipRewardEnv(gym.RewardWrapper):
 # ---------------------------------------------------------------------------
 
 
-def make_env(idx: int, config: TrainingConfig):
+def make_env(env_id: str, idx: int, seed: int, config: TrainingConfig):
     def thunk():
-        env = gym.make(config.env_id, frameskip=1)
+        env = gym.make(env_id, frameskip=1)
         env = gym.wrappers.RecordEpisodeStatistics(env)  # Track episode return and length for logging
         env = gym.wrappers.AtariPreprocessing(
             env,
@@ -91,7 +94,7 @@ def make_env(idx: int, config: TrainingConfig):
             screen_size=84,  # Downscale to 84x84 to reduce input dimensionality
             terminal_on_life_loss=False,  # Handled by EpisodicLifeEnv wrapper instead
             grayscale_obs=True,  # Convert RGB to single channel, reducing input size by 3x
-            scale_obs=True,  # Scale pixel values to [0, 1] float range
+            scale_obs=True,  # Keep uint8 pixels; the model normalizes via PIXEL_SCALE
         )
         env = EpisodicLifeEnv(env)
         env = FireResetEnv(env)
@@ -99,15 +102,15 @@ def make_env(idx: int, config: TrainingConfig):
         env = gym.wrappers.FrameStackObservation(
             env, config.frame_stack
         )  # Stack N consecutive frames to give the agent temporal context
-        env.action_space.seed(config.seed + idx)
-        env.observation_space.seed(config.seed + idx)
+        env.action_space.seed(seed + idx)
+        env.observation_space.seed(seed + idx)
         return env
 
     return thunk
 
 
-def make_vec_env(config: TrainingConfig):
-    envs = gym.vector.SyncVectorEnv([make_env(i, config) for i in range(config.num_envs)])
+def make_vec_env(config: TrainingConfig, seed: int):
+    envs = gym.vector.SyncVectorEnv([make_env(config.env_id, i, seed, config) for i in range(config.num_envs)])
     return envs
 
 
@@ -116,29 +119,33 @@ def make_vec_env(config: TrainingConfig):
 # ---------------------------------------------------------------------------
 
 
-def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingConfig):
+def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingConfig, device_manager: DeviceManager):
     b_obs, b_actions, b_log_probs, b_values = buffer.flatten()
     b_advantages = advantages.reshape(-1)
     b_returns = returns.reshape(-1)
-
     clip_fracs = []
 
-    dataset = TensorDataset(b_obs, b_actions, b_log_probs, b_values, b_advantages, b_returns)
-    loader = DataLoader(dataset, batch_size=config.minibatch_size, shuffle=True)
-
     for _ in range(config.update_epochs):
-        for mb_obs, mb_actions, mb_log_probs, mb_values, mb_adv, mb_returns in loader:
-            _, new_log_prob, entropy, new_value = agent.get_action_and_value(mb_obs, mb_actions)
-            log_ratio = new_log_prob - mb_log_probs
+        # Permutaion generated on CPU
+        indices = torch.randperm(config.batch_size).to(b_obs.device)
+        all_mb_indices = indices.reshape(-1, config.minibatch_size)
+
+        for i in range(4):
+            mb_idx = all_mb_indices[i]
+
+            # logger.info("[DEBUG SYNC] ENTROPY")
+            _, new_log_prob, entropy, new_value = agent.get_action_and_value(b_obs[mb_idx], b_actions[mb_idx])
+            log_ratio = new_log_prob - b_log_probs[mb_idx]
             ratio = log_ratio.exp()
 
             with torch.no_grad():
                 # calculate approx_kl http://joschu.net/blog/kl-approx.html
                 approx_kl = ((ratio - 1) - log_ratio).mean()
-                clip_fracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean().item())
+                clip_fracs.append(((ratio - 1.0).abs() > config.clip_coef).float().mean())
 
+            mb_adv = b_advantages[mb_idx]
             if config.norm_adv:
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + ADV_NORM_EPS)
+                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
             # Policy loss
             pg_loss1 = -mb_adv * ratio
@@ -148,70 +155,42 @@ def ppo_update(agent, optimizer, buffer, advantages, returns, config: TrainingCo
             # Value loss
             new_value = new_value.view(-1)
             if config.clip_vloss:
-                v_clipped = mb_values + torch.clamp(new_value - mb_values, -config.clip_coef, config.clip_coef)
-                v_loss1 = (new_value - mb_returns) ** 2
-                v_loss2 = (v_clipped - mb_returns) ** 2
+                v_clipped = b_values[mb_idx] + torch.clamp(
+                    new_value - b_values[mb_idx], -config.clip_coef, config.clip_coef
+                )
+                v_loss1 = (new_value - b_returns[mb_idx]) ** 2
+                v_loss2 = (v_clipped - b_returns[mb_idx]) ** 2
                 v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
             else:
-                v_loss = 0.5 * ((new_value - mb_returns) ** 2).mean()
+                v_loss = 0.5 * ((new_value - b_returns[mb_idx]) ** 2).mean()
 
             entropy_loss = entropy.mean()
             loss = pg_loss - config.ent_coef * entropy_loss + config.vf_coef * v_loss
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.parameters(), config.max_grad_norm)
-            optimizer.step()
+            if config.use_tt:
+                torch_xla.sync(wait=True)
+            grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), config.max_grad_norm)
+            device_manager.optimizer_step(optimizer)
 
-    mean_clip_frac = torch.tensor(clip_fracs).mean().item() if clip_fracs else 0.0
-    return pg_loss.item(), v_loss.item(), entropy_loss.item(), approx_kl.item(), mean_clip_frac
+    # Move all metrics to CPU for logging to avoid XLA sync issues.
+    if config.use_tt:
+        torch_xla.sync(wait=True)
+    # logger.info("[DEBUG SYNC] END PPO")
+    return (
+        pg_loss.item(),
+        v_loss.item(),
+        entropy_loss.item(),
+        approx_kl.item(),
+        np.mean([cf.item() for cf in clip_fracs]),
+        float(grad_norm),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main training
 # ---------------------------------------------------------------------------
-
-
-def collect_rollout(agent, envs, buffer, obs, done, config, device, episode_returns, global_step):
-    for _ in range(config.num_steps):
-        global_step += config.num_envs
-
-        with torch.no_grad():
-            action, log_prob, _, value = agent.get_action_and_value(obs)
-
-        next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
-
-        buffer.insert(
-            obs,
-            action,
-            log_prob,
-            torch.tensor(reward, device=device),
-            done,
-            value.flatten(),
-        )
-
-        obs = torch.tensor(next_obs, device=device)
-        done = torch.as_tensor(terminated | truncated, dtype=torch.float32).to(device)
-
-        if "_episode" not in infos:
-            continue
-        for i, finished in enumerate(infos["_episode"]):
-            if finished:
-                episode_returns.append(infos["episode"]["r"][i])
-
-    return obs, done, global_step
-
-
-def resume_from_checkpoint(config, checkpoint_manager, agent, optimizer, logger):
-    start_update = 1
-    global_step = 0
-    if config.resume_from_checkpoint:
-        checkpoint_info = checkpoint_manager.load_checkpoint(agent, optimizer)
-        if checkpoint_info:
-            start_update = checkpoint_info["step"] + 1
-            global_step = checkpoint_info.get("metrics", {}).get("global_step", 0)
-            logger.info(f"Resumed at update {start_update}, global_step {global_step:,}")
-    return start_update, global_step
 
 
 def train(
@@ -220,26 +199,34 @@ def train(
     logger: TrainingLogger,
     checkpoint_manager: CheckpointManager,
 ):
+    config.compute_derived()
     device = device_manager.device
 
-    envs = make_vec_env(config)
+    envs = make_vec_env(config, config.seed)
     num_actions = envs.single_action_space.n
     obs_shape = envs.single_observation_space.shape
 
     agent = BreakoutCNN(num_actions, config.frame_stack).to(device)
-    optimizer = torch.optim.Adam(agent.parameters(), lr=config.learning_rate, eps=1e-5, capturable=config.use_tt)
+    optimizer = torch.optim.Adam(agent.parameters(), lr=config.learning_rate, eps=1e-5)
 
     logger.info(f"Model parameters: {sum(p.numel() for p in agent.parameters())}")
 
     # Resume from checkpoint if configured.
-    start_update, global_step = resume_from_checkpoint(config, checkpoint_manager, agent, optimizer, logger)
+    start_update = 1
+    global_step = 0
+    if config.resume_from_checkpoint:
+        checkpoint_info = checkpoint_manager.load_checkpoint(agent, optimizer)
+        if checkpoint_info:
+            start_update = checkpoint_info["step"] + 1
+            global_step = checkpoint_info.get("metrics", {}).get("global_step", 0)
+            logger.info(f"Resumed at update {start_update}, global_step {global_step:,}")
 
     buffer = RolloutBuffer(config, obs_shape, device)
 
     # Start rollout collection.
     obs, _ = envs.reset(seed=config.seed)
-    obs = torch.tensor(obs).to(device)
-    done = torch.zeros(config.num_envs).to(device)
+    obs = torch.tensor(obs, device=device)
+    done = torch.zeros(config.num_envs, device=device)
 
     start_time = time.time()
     episode_returns = []
@@ -258,24 +245,80 @@ def train(
                 optimizer.param_groups[0]["lr"] = config.learning_rate * frac
 
             # Collect rollout.
-            obs, done, global_step = collect_rollout(
-                agent, envs, buffer, obs, done, config, device, episode_returns, global_step
-            )
+            for _ in range(config.num_steps):
+                global_step += config.num_envs
+
+                with torch.no_grad():
+                    action, log_prob, _, value = agent.get_action_and_value(obs)
+
+                next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
+                next_done = np.logical_or(terminated, truncated).astype(np.float32)
+
+                buffer.insert(
+                    obs,
+                    action,
+                    log_prob,
+                    torch.tensor(reward, device=device),
+                    done,
+                    value.flatten(),
+                )
+
+                obs = torch.tensor(next_obs, device=device)
+                done = torch.tensor(next_done, device=device)
+
+                # Log completed episodes.
+                if "_episode" in infos:
+                    for i, finished in enumerate(infos["_episode"]):
+                        if finished:
+                            episode_returns.append(infos["episode"]["r"][i])
 
             # Compute GAE.
             with torch.no_grad():
                 next_value = agent.get_value(obs).flatten()
             advantages, returns = buffer.compute_gae(next_value, done)
 
+            # ---- DIAGNOSTIC: pre-update probes ----
+            # adv_cpu = advantages.detach().float().cpu()
+            # ret_cpu = returns.detach().float().cpu()
+            # adv_has_nan = bool(torch.isnan(adv_cpu).any())
+            # adv_has_inf = bool(torch.isinf(adv_cpu).any())
+            # adv_abs_mean = adv_cpu.abs().mean().item()
+            # adv_std = adv_cpu.std().item()
+            # ret_abs_mean = ret_cpu.abs().mean().item()
+            # actor_w_before = agent.actor.weight.detach().float().cpu().clone()
+            # actor_w_norm_before = actor_w_before.norm().item()
+            # with torch.no_grad():
+            #     # probe logits on first 4 obs from buffer
+            #     probe_obs = buffer.flatten()[0][:4]
+            #     probe_logits = agent.actor(agent.network(probe_obs)).detach().float().cpu()
+            #     probe_spread = (probe_logits.max(dim=-1).values - probe_logits.min(dim=-1).values).mean().item()
+            #     if config.use_tt:
+            #         torch_xla.sync(wait=True)
+
             # PPO update.
-            pg_loss, v_loss, ent_loss, approx_kl, clip_frac = ppo_update(
-                agent, optimizer, buffer, advantages, returns, config
+            pg_loss, v_loss, ent_loss, approx_kl, clip_frac, grad_norm = ppo_update(
+                agent, optimizer, buffer, advantages, returns, config, device_manager
             )
+
+            # ---- DIAGNOSTIC: post-update probes ----
+            # actor_w_after = agent.actor.weight.detach().float().cpu()
+            # actor_w_delta_norm = (actor_w_after - actor_w_before).norm().item()
+            # actor_w_norm_after = actor_w_after.norm().item()
+            # logger.info(
+            #     f"[PROBE update={update:04d}] "
+            #     f"adv_abs_mean={adv_abs_mean:.3e} adv_std={adv_std:.3e} "
+            #     f"adv_nan={adv_has_nan} adv_inf={adv_has_inf} "
+            #     f"ret_abs_mean={ret_abs_mean:.3e} | "
+            #     f"grad_norm={grad_norm:.3e} | "
+            #     f"actor_w_norm before={actor_w_norm_before:.6f} after={actor_w_norm_after:.6f} "
+            #     f"|delta|={actor_w_delta_norm:.3e} | "
+            #     f"probe_logits_spread={probe_spread:.3e} ent_loss={ent_loss:.6f}"
+            # )
 
             # Logging.
             if update % config.log_interval == 0:
                 sps = int(global_step / (time.time() - start_time))
-                avg_ret = torch.tensor(episode_returns[-10:]).mean().item() if episode_returns else 0.0
+                avg_ret = np.mean(episode_returns[-10:]) if episode_returns else 0.0
 
                 logger.log_metrics(
                     {
@@ -302,7 +345,7 @@ def train(
                 )
 
         # Final save.
-        avg_ret = torch.tensor(episode_returns[-10:]).mean().item() if episode_returns else 0.0
+        avg_ret = np.mean(episode_returns[-10:]) if episode_returns else 0.0
         checkpoint_manager.save_checkpoint(
             agent,
             step=config.num_updates,

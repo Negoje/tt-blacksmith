@@ -12,7 +12,7 @@ anneal_lr: True
 num_steps: 128
 gamma: 0.99
 gae_lambda: 0.95
-num_minibatches: 4
+num_minibatches: 16
 update_epochs: 4
 clip_coef: 0.1
 norm_adv: True
@@ -55,4 +55,4 @@ deterministic: True
 
 # Other settings
 framework: "pytorch"
-use_tt: False
+use_tt: True
